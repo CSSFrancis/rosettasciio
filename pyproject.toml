@@ -118,6 +118,7 @@ doc = [
   "sphinxcontrib-towncrier",
   # unpin when sphinxcontrib-towncrier supports towncrier >=24
   "towncrier<24",
+  "sphinx_design",
 ]
 all = [
   "rosettasciio[blockfile]",
