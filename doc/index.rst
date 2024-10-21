@@ -66,6 +66,7 @@ Table of contents
 
    user_guide/index
    file_specification/index
+   user_guide/supported_formats
    api/index
    contributing
    changes
