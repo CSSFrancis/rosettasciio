@@ -445,6 +445,7 @@ class EMD_NCEM:
         Estimate, offset, scale from a 1D array
         """
         if axis_data.ndim > 0 and np.issubdtype(axis_data.dtype, np.number):
+            axis_data = np.squeeze(axis_data[:])
             offset, scale = float(axis_data[0]), float(np.diff(axis_data).mean())
         else:
             # This is a string, return default values
