@@ -590,7 +590,7 @@ def file_reader(
     if navigation_shape is not None:
         shape = shape[:2] + navigation_shape
 
-    data = file.memmap_distributed(
+    data = file.read_binary_distributed(
         filename,
         offset=f.tell(),
         shape=shape[::-1],

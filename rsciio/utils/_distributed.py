@@ -543,8 +543,13 @@ def read_binary_distributed(
         shape = int(os.path.getsize(filename) / unit_size)
     if not isinstance(shape, tuple):
         shape = (shape,)
+    shape = tuple(int(s) for s in shape)  # ensure plain Python ints
 
-    if chunks is _CHUNKS_DEFAULT:
+    # "auto" (dask default) splits all dims including signal dims, producing
+    # fragmented tile reads.  Treat it the same as our sentinel so we apply
+    # the smart sequential default.  Callers that genuinely want dask to
+    # choose chunk sizes across all dims can pass chunks=None explicitly.
+    if chunks is _CHUNKS_DEFAULT or chunks == "auto":
         chunks = _resolve_chunks_default(shape)
 
     # Cases that require the memmap path regardless of backend choice:
