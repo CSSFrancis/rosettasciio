@@ -393,114 +393,41 @@ def memmap_distributed(
     return data
 
 
-# Sentinel used by binary_read_distributed to distinguish "not passed" from None
+# Sentinel distinguishing "caller did not pass chunks" from None
 _CHUNKS_DEFAULT = object()
 
 
-def binary_read_distributed(
-    filename,
-    dtype,
-    positions=None,
-    offset=0,
-    shape=None,
-    order="C",
-    chunks=_CHUNKS_DEFAULT,
-    block_size_limit=None,
-    key=None,
-):
+def _resolve_chunks_default(shape):
     """
-    Distributed lazy reader optimised for sequential access to binary files.
+    Compute a sensible chunk default for a binary sequential read.
 
-    Drop-in replacement for :func:`memmap_distributed` with two improvements:
-
-    1. **Sequential-read chunk default.**  When ``chunks`` is not supplied,
-       the last two dimensions (the signal frame) are kept whole (``-1``) and
-       only the leading navigation dimensions are split automatically.  For a
-       4D-STEM file stored as ``(N_y, N_x, KY, KX)`` this means each dask
-       task reads a contiguous block of complete diffraction patterns, avoiding
-       the read amplification caused by splitting the signal frame across
-       multiple chunk boundaries.
-
-    2. **Direct sequential I/O per chunk.**  Instead of creating a
-       ``numpy.memmap`` of the entire file for each chunk call (which maps the
-       full file into the process address space), each chunk is read with
-       ``open() + seek + readinto()`` directly into the output numpy buffer.
-       This avoids the per-call mmap setup overhead and lets the OS
-       ``FILE_FLAG_SEQUENTIAL_SCAN`` hint (Windows) or ``fadvise(SEQUENTIAL)``
-       (Linux) trigger aggressive read-ahead across all RAID stripes.
-
-    Parameters
-    ----------
-    filename : str
-        Path to the binary file.
-    dtype : numpy.dtype
-        Data type.
-    positions : array-like, optional
-        Custom scan positions; see :func:`memmap_distributed`.
-        When provided, falls back to :func:`memmap_distributed`.
-    offset : int, optional
-        Byte offset to the start of data (after any file header).
-    shape : tuple, optional
-        Shape of the data.  If ``None``, inferred from file size and dtype.
-    order : str, optional
-        Memory order -- ``"C"`` (row-major, default) or ``"F"``.
-    chunks : tuple or str, optional
-        Dask chunk specification.  If not supplied, defaults to
-        ``("auto",) * (ndim - 2) + (-1, -1)`` to keep signal frames whole.
-        Pass ``"auto"`` to restore dask's default behaviour across all dims.
-    block_size_limit : int, optional
-        Maximum chunk size in bytes passed to dask chunk normalisation.
-    key : str, optional
-        Structured-dtype field to extract.  When provided, falls back to
-        :func:`memmap_distributed`.
-
-    Returns
-    -------
-    dask.array.Array
-
-    Notes
-    -----
-    For non-C-order data, structured dtypes with ``key``, or custom
-    ``positions``, falls back to :func:`memmap_distributed` transparently.
+    Keeps the last two dimensions (signal frame) whole so each dask task
+    reads a contiguous block of complete patterns -- avoids read amplification
+    from splitting diffraction frames across chunk boundaries.
     """
-    # Resolve shape early so the chunk default can inspect dimensionality
-    if shape is None:
-        unit_size = np.dtype(dtype).itemsize
-        shape = int(os.path.getsize(filename) / unit_size)
-    if not isinstance(shape, tuple):
-        shape = (shape,)
+    ndim = len(shape)
+    if ndim >= 3:
+        return ("auto",) * (ndim - 2) + (-1, -1)
+    elif ndim == 2:
+        return ("auto", -1)
+    return "auto"
 
-    # Compute default chunks: keep signal dims (last two) whole, split nav only
-    if chunks is _CHUNKS_DEFAULT:
-        ndim = len(shape)
-        if ndim >= 3:
-            chunks = ("auto",) * (ndim - 2) + (-1, -1)
-        elif ndim == 2:
-            chunks = ("auto", -1)
-        else:
-            chunks = "auto"
 
-    # Fall back to memmap_distributed for cases the sequential path can't handle
-    if positions is not None or key is not None:
-        return memmap_distributed(
-            filename,
-            dtype=dtype,
-            positions=positions,
-            offset=offset,
-            shape=shape,
-            order=order,
-            chunks=chunks,
-            block_size_limit=block_size_limit,
-            key=key,
-        )
+def _build_sequential_graph(filename, dtype, shape, offset, order, chunks,
+                             block_size_limit):
+    """
+    Build a dask graph that reads each chunk via open+seek+readinto.
 
+    Returns a dask.array.Array.  Used by read_binary_distributed when the
+    ``"sequential"`` backend is active.
+    """
     if dtype.names is not None:
-        array_dtype = dtype[key].base
-        sub_array_shape = dtype[key].shape
-    else:
-        array_dtype = dtype.base
-        sub_array_shape = dtype.shape
-
+        raise ValueError(
+            "Sequential backend does not support structured dtypes. "
+            "Use backend='memmap' or pass key= to memmap_distributed."
+        )
+    array_dtype = dtype.base
+    sub_array_shape = dtype.shape
     num_dim = len(shape + sub_array_shape)
 
     chunked_slices, data_chunks = get_chunk_slice(
@@ -526,4 +453,123 @@ def binary_read_distributed(
         positions=False,
         key=None,
         _sequential_read=True,
+    )
+
+
+def read_binary_distributed(
+    filename,
+    dtype,
+    positions=None,
+    offset=0,
+    shape=None,
+    order="C",
+    chunks=_CHUNKS_DEFAULT,
+    block_size_limit=None,
+    key=None,
+    backend=None,
+):
+    """
+    Distributed lazy reader for binary files with automatic backend selection.
+
+    Drop-in replacement for :func:`memmap_distributed`.  Adds:
+
+    * **Smart chunk default** -- signal frames (last two dims) are kept whole
+      so each dask task is a contiguous sequential read rather than a
+      fragmented tile.
+    * **Pluggable backends** -- choose how each chunk is read from disk.
+    * **Automatic machine detection** -- on first use, a short benchmark
+      determines the fastest backend for this storage device and caches
+      the result in ``platformdirs.user_config_dir("rosettasciio")``.
+
+    Backends
+    --------
+    ``"memmap"``
+        ``numpy.memmap`` -- maps the full file per chunk call.  Portable;
+        best when data is already in the OS page cache.
+    ``"sequential"``
+        ``open() + seek + readinto()`` directly into the output buffer.
+        Avoids full-file VMA overhead; OS read-ahead saturates RAID bandwidth.
+        Falls back to ``"memmap"`` for structured dtypes, ``positions``, or
+        F-order data.
+    ``None`` (default)
+        Use the system default chosen by
+        :func:`rsciio.utils.io_backend.get_default_backend`.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the binary file.
+    dtype : numpy.dtype
+        Data type.
+    positions : array-like, optional
+        Custom scan positions (see :func:`memmap_distributed`).
+    offset : int, optional
+        Byte offset to the start of data.
+    shape : tuple, optional
+        Shape of the data.  Inferred from file size if ``None``.
+    order : str, optional
+        ``"C"`` (default) or ``"F"``.
+    chunks : tuple or str, optional
+        Dask chunk spec.  Default keeps signal frames whole:
+        ``("auto",) * (ndim-2) + (-1, -1)``.
+    block_size_limit : int, optional
+        Max chunk bytes for dask normalisation.
+    key : str, optional
+        Structured-dtype field to extract.
+    backend : str or None, optional
+        ``"memmap"``, ``"sequential"``, or ``None`` (auto-detect).
+
+    Returns
+    -------
+    dask.array.Array
+
+    See Also
+    --------
+    rsciio.utils.io_backend.get_default_backend
+    rsciio.utils.io_backend.set_default_backend
+    rsciio.utils.io_backend.benchmark_backends
+    """
+    from rsciio.utils._io_backend import get_default_backend, BACKENDS
+
+    if backend is None:
+        backend = get_default_backend()
+
+    if backend not in BACKENDS:
+        raise ValueError(f"Unknown backend {backend!r}. Must be one of {BACKENDS}.")
+
+    # Resolve shape before computing chunk default
+    if shape is None:
+        unit_size = np.dtype(dtype).itemsize
+        shape = int(os.path.getsize(filename) / unit_size)
+    if not isinstance(shape, tuple):
+        shape = (shape,)
+
+    if chunks is _CHUNKS_DEFAULT:
+        chunks = _resolve_chunks_default(shape)
+
+    # Cases that require the memmap path regardless of backend choice:
+    # structured dtypes with key, arbitrary positions, F-order
+    use_memmap = (
+        backend == "memmap"
+        or positions is not None
+        or key is not None
+        or order != "C"
+        or (dtype.names is not None)
+    )
+
+    if use_memmap:
+        return memmap_distributed(
+            filename,
+            dtype=dtype,
+            positions=positions,
+            offset=offset,
+            shape=shape,
+            order=order,
+            chunks=chunks,
+            block_size_limit=block_size_limit,
+            key=key,
+        )
+
+    return _build_sequential_graph(
+        filename, dtype, shape, offset, order, chunks, block_size_limit
     )
