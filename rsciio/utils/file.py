@@ -23,6 +23,7 @@
 import importlib
 
 __all__ = [
+    "binary_read_distributed",
     "get_file_handle",
     "inspect_npy_bytes",
     "memmap_distributed",
@@ -34,6 +35,7 @@ def __dir__():
 
 
 _import_mapping = {
+    "binary_read_distributed": "_distributed",
     "get_file_handle": "_tools",
     "inspect_npy_bytes": "_tools",
     "memmap_distributed": "_distributed",
