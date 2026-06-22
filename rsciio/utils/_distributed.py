@@ -157,45 +157,79 @@ def _slice_sequential(
     order: str,
 ) -> np.ndarray:
     """
-    Read a contiguous leading-axis slice from ``file`` using a buffered
-    sequential file handle (open + seek + readinto).
+    Read a chunk slice from ``file`` using buffered sequential reads
+    (open + seek + readinto), reading ONLY the bytes the slice covers.
 
-    Only used for C-order data where the requested slice covers complete
-    leading rows (i.e. a contiguous byte range in the file).  Falls back
-    to ``numpy.memmap`` for non-contiguous or F-order cases.
+    For C-order data every chunk is a union of contiguous byte runs: the
+    trailing axes that are read in full extent (plus the last sliced axis,
+    whose contiguous index range is also contiguous on disk) form one run;
+    the outer sliced axes are iterated, one seek+readinto per run. This reads
+    exactly the requested bytes — never the whole file — so a 4-D chunk that
+    is chunked on BOTH navigation axes (e.g. a non-square scan's
+    ``(64, 64, ky, kx)`` chunk) is read distributed-style instead of mapping
+    the full multi-GB file (which fails on Windows with WinError 8).
+
+    F-order is not contiguous-friendly this way → fall back to ``numpy.memmap``
+    of the requested region only.
     """
     ndim = len(full_shape)
     itemsize = dtype.itemsize
+    full_shape = tuple(int(s) for s in full_shape)
+    result_shape = tuple(int(slices_[i, 1] - slices_[i, 0]) for i in range(ndim))
 
-    # Check contiguity: C-order, all dims except dim-0 must be full extent
-    is_contiguous = order == "C"
-    if is_contiguous and ndim > 1:
-        for i in range(1, ndim):
-            if slices_[i, 0] != 0 or int(slices_[i, 1]) != int(full_shape[i]):
-                is_contiguous = False
-                break
-
-    if not is_contiguous:
+    if order != "C":
+        # F-order: bounded memmap of just the leading-axis band, then slice the
+        # inner dims (never maps the whole file).
         mm = np.memmap(
             file, dtype=dtype, shape=full_shape, mode="r",
             offset=byte_offset, order=order,
         )
         return np.array(mm[tuple(slice(int(s[0]), int(s[1])) for s in slices_)])
 
-    # Contiguous path: one seek + one readinto, no extra copy
-    stride0 = int(np.prod(full_shape[1:])) * itemsize
-    row_start = int(slices_[0, 0])
-    row_stop  = int(slices_[0, 1])
-    n_rows    = row_stop - row_start
-    file_start = byte_offset + row_start * stride0
-    n_bytes    = n_rows * stride0
+    # Per-axis element stride in C-order (items, not bytes).
+    elem_strides = [1] * ndim
+    for i in range(ndim - 2, -1, -1):
+        elem_strides[i] = elem_strides[i + 1] * full_shape[i + 1]
 
-    result_shape = tuple(int(s[1] - s[0]) for s in slices_)
-    out = np.empty(result_shape, dtype=dtype, order=order)
+    # The contiguous run covers the LAST axis that is actually sliced (i.e. not
+    # full extent) plus every axis after it (all full extent). `run_axis` is the
+    # first axis from the end whose slice is the full extent breaks the search;
+    # we want the last NON-full axis. Default: only the innermost run when all
+    # axes are full (whole array) or the leading axis is the only sliced one.
+    run_axis = 0
+    for i in range(ndim):
+        if not (slices_[i, 0] == 0 and int(slices_[i, 1]) == full_shape[i]):
+            run_axis = i  # last sliced (non-full) axis seen so far
+    # Run length in items: from run_axis (its sliced extent) through the end.
+    run_items = result_shape[run_axis] * int(np.prod(full_shape[run_axis + 1:])) \
+        if run_axis + 1 <= ndim else result_shape[run_axis]
+    run_items = int(run_items)
 
+    out = np.empty(result_shape, dtype=dtype, order="C")
+    out_flat = out.reshape(-1)
+
+    # Iterate the OUTER axes (those before run_axis); each combination is one
+    # contiguous run on disk and one contiguous block in the output.
+    outer_axes = range(run_axis)
+    outer_ranges = [range(int(slices_[a, 0]), int(slices_[a, 1])) for a in outer_axes]
+    out_block = 0
     with open(file, "rb") as fh:
-        fh.seek(file_start)
-        fh.readinto(out)  # zero-copy into the numpy buffer
+        if not outer_ranges:
+            # Single contiguous run (e.g. leading axis only, or whole array).
+            start_elem = sum(int(slices_[a, 0]) * elem_strides[a] for a in range(ndim))
+            fh.seek(byte_offset + start_elem * itemsize)
+            fh.readinto(out_flat)
+        else:
+            import itertools as _it
+            for combo in _it.product(*outer_ranges):
+                start_elem = 0
+                for a, idx in zip(outer_axes, combo):
+                    start_elem += idx * elem_strides[a]
+                # add the offset of the run_axis slice start and deeper full axes
+                start_elem += int(slices_[run_axis, 0]) * elem_strides[run_axis]
+                fh.seek(byte_offset + start_elem * itemsize)
+                fh.readinto(out_flat[out_block:out_block + run_items])
+                out_block += run_items
 
     return out
 
