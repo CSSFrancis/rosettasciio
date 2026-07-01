@@ -292,5 +292,12 @@ def memmap_distributed(
         drop_axis=drop_axes,
         positions=use_positions,
         key=key,
+        # Without an explicit meta, dask's blockwise() calls compute_meta(),
+        # which runs slice_memmap() for real (with the real filename/shape)
+        # just to infer dtype/ndim. That opens+mmaps the whole file during
+        # graph construction -- i.e. during hs.load(), even when lazy=True --
+        # which is expensive on network filesystems. dask normalizes this to
+        # the correct ndim on its own, so a 0-length 1D array is sufficient.
+        meta=np.empty((0,), dtype=array_dtype),
     )
     return data
